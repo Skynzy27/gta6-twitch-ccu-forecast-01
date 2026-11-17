@@ -1,31 +1,24 @@
-// gta6-twitch-ccu-forecast-01 — log-scale launch-curve forecaster (Node 22, stdlib only).
+// gta6-twitch-ccu-forecast-01 — v2: group-aware launch-curve forecaster (Node 22, stdlib only).
 //
-// Idea: a launch day's Twitch curve is mostly decided by WHEN the game unlocks
-// relative to UTC midnight, and by how much of its audience was already watching
-// in hour 1. Hour 1's print anchors the level; the shape (log viewers at hour h
-// minus log viewers at hour 1) is borrowed from past big launches in the case's
-// own `comparables`, with three views blended per hour:
+// What v1 got wrong (practice loss 0.221, rank #3077): its per-hour regression of the
+// log-ratio curve on log hour-1 size pooled every unlock family. A rolling-midnight
+// launch ramps up through the day as regions unlock; a simultaneous launch starts at
+// its peak and decays; an early-access launch is flat. Pooling them averages a rise
+// with a fall, so for a rolling target — which is what GTA VI is, and what all four
+// practice launches are — v1's median ramp came out ~0.2 log units too flat late in
+// the day. v2 fixes the bias at its source: the regression carries unlock-family
+// indicators (rolling / simultaneous / early-access), so each family's shape is fit
+// on its own level while the size slope is shared. The rest is the same honest
+// machinery: hour 1 anchors the level, the spread is the leave-one-out residuals
+// of the 12 nearest comparables (widened 1.3x, because v1's 90% interval covered
+// only ~89% on practice), and the median gets a per-hour calibration offset shrunk
+// halfway toward the global offset.
 //
-//   1. a quadratic regression of the log-ratio on log(hour-1 viewers), fitted on
-//      comparables whose hour 1 was at least 5,000 (the tiny-hour-1 launches,
-//      whose unlock falls late in the day and whose ratios explode 100-2000x,
-//      would otherwise drag the fit);
-//   2. the median log-ratio of the 12 comparables nearest in log hour-1 size;
-//   3. the median log-ratio of the rolling-midnight-unlock comparables
-//      (GTA VI unlocks at local midnight, rolling, so this is its own family).
-//
-//   Weights 0.7 / 0.15 / 0.15, then a light 3-point smooth across hours. The spread
-// is honest, not fitted to look confident: for each of the 12 nearest
-// comparables we re-predict its curve leaving it out of the pool and keep the
-// residual; the 5/25/75/95 quantiles are the empirical quantiles of those
-// leave-one-out residuals per hour. A target as big as GTA VI gets the tight
-// spread of other big launches, not the wild spread of tiny ones.
-//
-// Everything the program knows comes from the case file it is given. No
-// network, no clock, no randomness: two runs on the same case write the same
-// bytes. The target's own history, streams and categories_hourly are deliberately
-// unused — they are null in the practice cases, so no use of them could have
-// been validated before the final.
+// Everything the program knows comes from the case file it is given. No network,
+// no clock, no randomness: two runs on the same case write the same bytes. The
+// target's own history, streams and categories_hourly are deliberately unused —
+// they are null in the practice cases, so no use of them could have been validated
+// before the final.
 //
 // Output: /output/<id>.out = {"hours":[{"hour":2,"q":[q05,q25,q50,q75,q95]}, ...]},
 // exactly 23 rows, hours 2..24, each q finite, > 0, at most 1e9, non-decreasing.
@@ -42,12 +35,14 @@ const LEVELS = [0.05, 0.25, 0.5, 0.75, 0.95];
 const HOURS: number[] = [];
 for (let h = 2; h <= 24; h++) HOURS.push(h);
 
-/** Blend weights: [quadratic log-size regression, kNN median, rolling-midnight median]. */
+/** Blend weights: [family-aware size regression, kNN median, rolling-midnight median]. */
 const W = [0.7, 0.15, 0.15];
 /** kNN neighbourhood size (also the residual pool). */
 const K = 12;
 /** Comparables below this hour-1 size are left out of the regression fit. */
 const FIT_MIN_H1 = 5000;
+/** How much the honest spread is widened (v1's 90% interval under-covered). */
+const SPREAD = 1.3;
 
 interface HourlyRow { from: string; viewers: number; channels?: number | null }
 interface Comparable {
@@ -59,9 +54,11 @@ interface Comparable {
 }
 interface Case {
   levels: number[];
-  known: Array<{ hour: number; viewers: number }>;
+  known: Array<{ hour: number; viewers: number; channels?: number | null }>;
   forecast: Array<{ hour: number }>;
   comparables: Comparable[];
+  notes?: string;
+  game?: { name?: string };
 }
 
 /** x rounded to 2 decimals (half up), matching the house baseline's rounding. */
@@ -92,16 +89,23 @@ function dayCurve(c: Comparable): number[] | null {
   return curve;
 }
 
-/** Unlock family, from the comparable's own unlock note. */
-function groupOf(c: Comparable): string {
-  const u = (c.unlock ?? '').toLowerCase();
+/**
+ * Unlock family, from a free-text unlock note. The same keyword rules are used
+ * for the comparables' `unlock` field and for the target's `notes` field.
+ * Order matters: an "early access" mention only counts when the note says the
+ * early access itself began at midnight (otherwise it is just a passing mention,
+ * e.g. Diablo IV's "Early access 2023-06-01"), and a "simultaneous" mention
+ * beats a "midnight local" one (e.g. Elden Ring's PC simultaneous unlock).
+ */
+function familyOf(note: string | undefined): string {
+  const u = (note ?? '').toLowerCase();
   if (
     u.includes('early access') &&
     (u.includes('from midnight') || u.includes('began') || u.includes('72 h') ||
       u.includes('premium') || u.includes('deluxe'))
   ) return 'early';
   if (u.includes('simultaneous') || u.includes('single global')) return 'simul';
-  if (u.includes('midnight local')) return 'rolling';
+  if (u.includes('midnight local') || u.includes('rolling')) return 'rolling';
   return 'other';
 }
 
@@ -125,7 +129,7 @@ function buildPool(cs: Case): Member[] {
     const h1 = Math.max(1, curve[0]);
     const logRatio = new Map<number, number>();
     for (const h of HOURS) logRatio.set(h, Math.log(Math.max(1, curve[h - 1]) / h1));
-    pool.push({ name: c.name ?? '', group: groupOf(c), h1, logH1: Math.log(h1), logRatio });
+    pool.push({ name: c.name ?? '', group: familyOf(c.unlock), h1, logH1: Math.log(h1), logRatio });
   }
   pool.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
   return pool;
@@ -162,10 +166,35 @@ function solve(A: number[][], b: number[]): number[] | null {
 }
 
 /**
- * Median log-ratio curve for a target of log hour-1 size `logH1`, from a pool.
- * The three views (quadratic size regression, kNN median, rolling median).
+ * One row of the regression design: [1, centred log hour-1 size, is-rolling,
+ * is-simul, is-early, squared centred log size]. The family indicators let each
+ * unlock family sit on its own level while the size slope (and its curvature)
+ * is shared across families — that is the whole v2 fix.
  */
-function predictMedian(logH1: number, pool: Member[]): Map<number, number> {
+function designRow(logH1: number, group: string, center: number): number[] {
+  const d = logH1 - center;
+  return [
+    1,
+    d,
+    group === 'rolling' ? 1 : 0,
+    group === 'simul' ? 1 : 0,
+    group === 'early' ? 1 : 0,
+    d * d,
+  ];
+}
+
+/**
+ * Median log-ratio curve for a target of log hour-1 size `logH1` and unlock
+ * family `targetGroup`, from a pool. Three views blended per hour:
+ *   1. the family-aware size regression above, fitted on comparables whose
+ *      hour 1 was at least 5,000 (the tiny-hour-1 launches, whose unlock falls
+ *      late in the day and whose ratios explode 100-2000x, would otherwise
+ *      drag the fit);
+ *   2. the median log-ratio of the 12 comparables nearest in log hour-1 size;
+ *   3. the median log-ratio of the rolling-midnight-unlock comparables
+ *      (GTA VI unlocks at local midnight, rolling, so this is its own family).
+ */
+function predictMedian(logH1: number, targetGroup: string, pool: Member[]): Map<number, number> {
   const med = new Map<number, number>();
   const fitPool = pool.filter((m) => m.h1 >= FIT_MIN_H1);
   const use = fitPool.length >= 5 ? fitPool : pool;
@@ -177,15 +206,14 @@ function predictMedian(logH1: number, pool: Member[]): Map<number, number> {
       return da !== db ? da - db : a.name < b.name ? -1 : 1;
     })
     .slice(0, K);
+  const center = use.map((m) => m.logH1).reduce((a, b) => a + b, 0) / use.length;
 
   for (const h of HOURS) {
-    // (1) Quadratic OLS of log-ratio on centred log hour-1 size.
+    // (1) Family-aware OLS of log-ratio on centred log hour-1 size.
     let e1 = 0;
-    const xs = use.map((m) => m.logH1);
     const ys = use.map((m) => m.logRatio.get(h) ?? 0);
-    const mx = xs.reduce((a, b) => a + b, 0) / xs.length;
-    const X = xs.map((x) => [1, x - mx, (x - mx) * (x - mx)]);
-    const n = 3;
+    const X = use.map((m) => designRow(m.logH1, m.group, center));
+    const n = X[0].length;
     const A: number[][] = [];
     const v: number[] = [];
     for (let a = 0; a < n; a++) {
@@ -195,8 +223,8 @@ function predictMedian(logH1: number, pool: Member[]): Map<number, number> {
     }
     const beta = solve(A, v);
     if (beta !== null) {
-      const d = logH1 - mx;
-      e1 = beta[0] + beta[1] * d + beta[2] * d * d;
+      const tRow = designRow(logH1, targetGroup, center);
+      e1 = tRow.reduce((s, x, i) => s + x * beta[i], 0);
     } else {
       e1 = ys.reduce((a, b) => a + b, 0) / ys.length;
     }
@@ -235,11 +263,14 @@ function forecastCase(cs: Case): { hours: Array<{ hour: number; q: number[] }> }
   const p1 = Math.max(1, first.viewers);
   const logH1 = Math.log(p1);
   const pool = buildPool(cs);
+  // The target's unlock family, read from the case's own notes; GTA VI is a
+  // rolling-midnight launch by design, so that is the fallback.
+  const targetGroup = familyOf(cs.notes) === 'other' ? 'rolling' : familyOf(cs.notes);
 
   let med: Map<number, number>;
   let resid = new Map<number, number[]>();
   if (pool.length >= 5) {
-    med = predictMedian(logH1, pool);
+    med = predictMedian(logH1, targetGroup, pool);
     // Leave-one-out residuals of the 12 nearest comparables: the honest spread.
     const near = [...pool]
       .sort((a, b) => {
@@ -251,7 +282,7 @@ function forecastCase(cs: Case): { hours: Array<{ hour: number; q: number[] }> }
     for (const h of HOURS) resid.set(h, []);
     for (const m of near) {
       const sub = pool.filter((x) => x !== m);
-      const mj = predictMedian(m.logH1, sub);
+      const mj = predictMedian(m.logH1, m.group, sub);
       for (const h of HOURS) {
         resid.get(h)?.push((m.logRatio.get(h) ?? 0) - (mj.get(h) ?? 0));
       }
@@ -262,22 +293,27 @@ function forecastCase(cs: Case): { hours: Array<{ hour: number; q: number[] }> }
     for (const h of HOURS) resid.set(h, [-0.15 * Math.sqrt(h - 1), 0.15 * Math.sqrt(h - 1)]);
   }
 
-  // Median calibration: the median of the per-hour residual medians.
-  const q50Offset =
-    pool.length >= 5
-      ? median(HOURS.map((h) => median(resid.get(h) ?? [0])))
-      : 0;
+  // Median calibration: the per-hour residual median, shrunk halfway toward
+  // the global offset (the median of the per-hour residual medians). The bias
+  // is hour-dependent — early hours run high, late hours run low — so a single
+  // global offset leaves a systematic error in both directions.
+  const globalOff = pool.length >= 5 ? median(HOURS.map((h) => median(resid.get(h) ?? [0]))) : 0;
+  const q50Off = new Map<number, number>();
+  for (const h of HOURS) {
+    const perHour = median(resid.get(h) ?? [0]);
+    q50Off.set(h, (perHour + globalOff) / 2);
+  }
 
   const hours = cs.forecast.map(({ hour }) => {
     const m = med.get(hour) ?? 0;
     const r = [...(resid.get(hour) ?? [0])].sort((a, b) => a - b);
+    const center = median(r);
     const qs = LEVELS.map((tau, j) => {
-      // The median level uses the blended median plus a calibration offset:
-      // the median of the per-hour residual medians. The blend is a mean of
-      // three medians and the comparables' big late-unlock ramps pull it up,
-      // so the offset (typically about -0.08 in log units) recentres it.
-      const spread = j === 2 ? q50Offset : empQuantile(r, tau);
-      return clamp(round2(p1 * Math.exp(m + spread)), 1, 1e9);
+      if (j === 2) return clamp(round2(p1 * Math.exp(m + q50Off.get(hour) ?? 0)), 1, 1e9);
+      // Tail quantiles: empirical residual quantile, re-centred on the residual
+      // median and widened — v1's 90% interval covered only ~89% on practice.
+      const spread = empQuantile(r, tau);
+      return clamp(round2(p1 * Math.exp(m + center + (spread - center) * SPREAD)), 1, 1e9);
     });
     // Enforce non-decreasing (rounding can tie adjacent levels; never invert).
     for (let j = 1; j < qs.length; j++) qs[j] = Math.max(qs[j], qs[j - 1]);
