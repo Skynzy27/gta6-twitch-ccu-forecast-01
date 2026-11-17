@@ -1,24 +1,42 @@
-// gta6-twitch-ccu-forecast-01 — v2: group-aware launch-curve forecaster (Node 22, stdlib only).
+// gta6-twitch-ccu-forecast-01 — v3: group-aware launch-curve forecaster, reference-class spread (Node 22, stdlib only).
 //
-// What v1 got wrong (practice loss 0.221, rank #3077): its per-hour regression of the
-// log-ratio curve on log hour-1 size pooled every unlock family. A rolling-midnight
-// launch ramps up through the day as regions unlock; a simultaneous launch starts at
-// its peak and decays; an early-access launch is flat. Pooling them averages a rise
-// with a fall, so for a rolling target — which is what GTA VI is, and what all four
-// practice launches are — v1's median ramp came out ~0.2 log units too flat late in
-// the day. v2 fixes the bias at its source: the regression carries unlock-family
-// indicators (rolling / simultaneous / early-access), so each family's shape is fit
-// on its own level while the size slope is shared. The rest is the same honest
-// machinery: hour 1 anchors the level, the spread is the leave-one-out residuals
-// of the 12 nearest comparables (widened 1.3x, because v1's 90% interval covered
-// only ~89% on practice), and the median gets a per-hour calibration offset shrunk
-// halfway toward the global offset.
+// What v2 got right and what it did not (practice 0.184, rank #1575; v1 was 0.221, #3077):
+// v2's median machinery — family-aware per-hour regression of the log-ratio on log
+// hour-1 size, blended 0.7/0.15/0.15 with a kNN median and a rolling-midnight median —
+// is the best median of 36 LOO variants tried for v3 (extra features: pre-release
+// level/trend, pre-release diurnal profile, channels, viewers-per-channel, console-only;
+// a 1-PC factor model; direct quantile regression; family-specific size slopes;
+// recency weighting; winsorised fits; restricted fit pools; blend-weight sweeps).
+// Every one of them made rolling-big LOO worse or equal, so the median stays exactly
+// as v2 built it. What changes is the SPREAD, and only the spread.
+//
+// v2 pooled the leave-one-out residuals of the 12 nearest comparables across ALL
+// families. But the scored cases are all rolling-midnight launches, and their shape
+// variance dwarfs the pooled one: the 8 rolling-big curves span five distinct shapes
+// (steady ramp / step-flat / explosive / dip-ramp / decay-recover), the per-hour
+// residual sd late in the day is ~0.6 log units, and v2's 90% interval covered only
+// 0.79 of rolling-big hours. v3 takes the residual pool from the target's OWN unlock
+// family (for GTA VI: the 8 rolling launches) and widens it 1.6x instead of 1.3x.
+// LOO (contest pinball on the log scale, verified against the program's own output):
+// ROLL-BIG 0.1502 (v2 0.1498 — no change), single-player rolling-big 0.1880 (v2
+// 0.2006), rolling-big 90% coverage 0.85 (v2 0.79). The single-player gain is driven
+// almost entirely by the Resident Evil Requiem tail (0.521 -> 0.412); v3 loses on 6
+// of the 8 normal rolling-big launches. It is tail insurance, not a better median,
+// and over 36 trials a 6% single-player gain is inside selection noise — reported
+// honestly as such. Estimated practice ~0.17-0.19 (calibration from the v1+v2
+// two-point fit: practice ≈ 1.27x LOO ROLL-BIG, ≈ 0.99x LOO single-player
+// rolling-big). That is BELOW the top-400 bar (0.141) and the submit gate (0.15):
+// v3 is built and verified, but the parent was told NOT to submit it on this evidence.
+// The remaining error is the launch-day shape variance itself, and no pre-launch
+// observable — hour-1 size, channels, pre-release level, pre-release diurnal profile,
+// unlock note — predicts which of the five shapes a launch takes.
 //
 // Everything the program knows comes from the case file it is given. No network,
 // no clock, no randomness: two runs on the same case write the same bytes. The
 // target's own history, streams and categories_hourly are deliberately unused —
-// they are null in the practice cases, so no use of them could have been validated
-// before the final.
+// streams/categories are null in the practice cases; history (pre-release diurnal
+// profile, pre-release level/trend) was tested in LOO and did not predict the
+// launch-day shape, so it stays unused.
 //
 // Output: /output/<id>.out = {"hours":[{"hour":2,"q":[q05,q25,q50,q75,q95]}, ...]},
 // exactly 23 rows, hours 2..24, each q finite, > 0, at most 1e9, non-decreasing.
@@ -37,12 +55,14 @@ for (let h = 2; h <= 24; h++) HOURS.push(h);
 
 /** Blend weights: [family-aware size regression, kNN median, rolling-midnight median]. */
 const W = [0.7, 0.15, 0.15];
-/** kNN neighbourhood size (also the residual pool). */
+/** kNN neighbourhood size (the median views use it; the spread no longer does). */
 const K = 12;
 /** Comparables below this hour-1 size are left out of the regression fit. */
 const FIT_MIN_H1 = 5000;
-/** How much the honest spread is widened (v1's 90% interval under-covered). */
-const SPREAD = 1.3;
+/** How much the honest spread is widened. v3: 1.6x — the rolling-family residual
+ *  pool is wider than the pooled one, and v2's 90% interval covered only 0.79 of
+ *  rolling-big hours at 1.3x. */
+const SPREAD = 1.6;
 
 interface HourlyRow { from: string; viewers: number; channels?: number | null }
 interface Comparable {
@@ -169,7 +189,7 @@ function solve(A: number[][], b: number[]): number[] | null {
  * One row of the regression design: [1, centred log hour-1 size, is-rolling,
  * is-simul, is-early, squared centred log size]. The family indicators let each
  * unlock family sit on its own level while the size slope (and its curvature)
- * is shared across families — that is the whole v2 fix.
+ * is shared across families — that is the v2 fix, kept unchanged in v3.
  */
 function designRow(logH1: number, group: string, center: number): number[] {
   const d = logH1 - center;
@@ -271,14 +291,14 @@ function forecastCase(cs: Case): { hours: Array<{ hour: number; q: number[] }> }
   let resid = new Map<number, number[]>();
   if (pool.length >= 5) {
     med = predictMedian(logH1, targetGroup, pool);
-    // Leave-one-out residuals of the 12 nearest comparables: the honest spread.
-    const near = [...pool]
-      .sort((a, b) => {
-        const da = Math.abs(a.logH1 - logH1);
-        const db = Math.abs(b.logH1 - logH1);
-        return da !== db ? da - db : a.name < b.name ? -1 : 1;
-      })
-      .slice(0, K);
+    // Leave-one-out residuals of the target's OWN unlock family: the honest
+    // spread. v2 used the 12 nearest comparables across all families, but the
+    // scored cases are all rolling-midnight launches and their shape variance
+    // dwarfs the pooled one — the spread has to come from the reference class
+    // (for GTA VI: the rolling launches), not from the nearest sizes. Each
+    // family member is re-predicted leaving it out of the pool, so no launch
+    // grades its own residual.
+    const near = pool.filter((m) => m.group === targetGroup);
     for (const h of HOURS) resid.set(h, []);
     for (const m of near) {
       const sub = pool.filter((x) => x !== m);
@@ -311,7 +331,8 @@ function forecastCase(cs: Case): { hours: Array<{ hour: number; q: number[] }> }
     const qs = LEVELS.map((tau, j) => {
       if (j === 2) return clamp(round2(p1 * Math.exp(m + q50Off.get(hour) ?? 0)), 1, 1e9);
       // Tail quantiles: empirical residual quantile, re-centred on the residual
-      // median and widened — v1's 90% interval covered only ~89% on practice.
+      // median and widened 1.6x — v2's 1.3x left the 90% interval covering only
+      // 0.79 of rolling-big hours; the wider family pool needs the wider factor.
       const spread = empQuantile(r, tau);
       return clamp(round2(p1 * Math.exp(m + center + (spread - center) * SPREAD)), 1, 1e9);
     });
